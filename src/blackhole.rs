@@ -1,16 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Data, FromSample, Sample, SampleFormat, Stream, StreamError};
+use cpal::{Stream, StreamError};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::stream;
 
 pub struct Blackhole {
-    host: cpal::Host,
     device: cpal::Device,
     config: cpal::StreamConfig,
     rb_prod: Arc<Mutex<HeapProd<f32>>>,
-    rb_cons: HeapCons<f32>,
 }
 
 // Error Handling
@@ -26,7 +23,7 @@ fn buffer_audio(data: &[f32], _info: &cpal::InputCallbackInfo, rb_prod: &mut Hea
 }
 
 impl Blackhole {
-    pub fn new() -> Blackhole {
+    pub fn new() -> (Blackhole, HeapCons<f32>) {
         let host = cpal::default_host();
 
         // choosing a device, looking for blackhole
@@ -49,7 +46,7 @@ impl Blackhole {
             .expect("Could not get Deffault Config from Blackhole");
 
         // Quick checks
-        println!("Device Name: {:?}", device.description());
+        // println!("Device Name: {:?}", device.description());
         println!("Sample Rate: {}", supported_stream_config.sample_rate());
         println!("Sample Format: {}", supported_stream_config.sample_format());
         println!("Channels: {}", supported_stream_config.channels());
@@ -66,19 +63,18 @@ impl Blackhole {
          * 4096 Samples = 85ms
          */
         let rb = HeapRb::<f32>::new(4096);
-        let (mut producer, mut consumer) = rb.split();
+        let (producer, consumer) = rb.split();
 
-        Blackhole {
-            host,
+        let blackhole = Blackhole {
             device,
             config,
             rb_prod: Arc::new(Mutex::new(producer)),
-            rb_cons: consumer,
-        }
+        };
+        (blackhole, consumer)
     }
 
     // use a Ring Buffer to get load the audio
-    fn stream_start(&self) -> Result<Stream, cpal::BuildStreamError> {
+    pub fn build_stream(&self) -> Result<Stream, cpal::BuildStreamError> {
         let prod = Arc::clone(&self.rb_prod);
         // Get the PCM audio Bytes from Blackhole
         let stream = self.device.build_input_stream(
