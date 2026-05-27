@@ -127,6 +127,12 @@ impl AudioOut {
         const MAX_TRIM: f32 = 0.001; // 0.1%
         const MAX_NOMINAL_DEV: f32 = 0.02; // 2% — cap on learned clock ratio
         let trim_gain: f32 = MAX_TRIM / 100.0; // saturate at err = 100 frames
+        // Integral term: closes the steady-state fill bias that the P-only
+        // trim can't eliminate. INT_GAIN is per-output-frame; with err≈300
+        // it accumulates to MAX_TRIM in ~30 s, then saturates and pulls
+        // fill back to target without overshoot when paired with the P term.
+        const INT_GAIN: f32 = 1.0e-9;
+        let mut integral_err: f32 = 0.0;
         // Warmup schedule: short windows with high gain so we lock onto the
         // true clock ratio in ~10 s instead of minutes. Each entry is
         // (window_seconds, ema_gain). After the schedule we use the last entry.
@@ -167,7 +173,20 @@ impl AudioOut {
                         let fill_frames = consumer.occupied_len() / channels;
                         let err = fill_frames as i64 - target as i64;
                         let trim = (err as f32 * trim_gain).clamp(-MAX_TRIM, MAX_TRIM);
-                        let step = nominal_step + trim;
+                        // Anti-windup: only integrate when bias isn't already
+                        // saturated in the same direction. Otherwise a target
+                        // step makes the integrator overshoot for seconds
+                        // after fill recovers.
+                        let unclamped_bias = INT_GAIN * integral_err;
+                        let saturating_high =
+                            unclamped_bias >= MAX_TRIM && err as f32 > 0.0;
+                        let saturating_low =
+                            unclamped_bias <= -MAX_TRIM && (err as f32) < 0.0;
+                        if !saturating_high && !saturating_low {
+                            integral_err += err as f32;
+                        }
+                        let bias = (INT_GAIN * integral_err).clamp(-MAX_TRIM, MAX_TRIM);
+                        let step = nominal_step + trim + bias;
 
                         while phase >= 1.0 {
                             std::mem::swap(&mut prev_frame, &mut next_frame);
@@ -217,9 +236,11 @@ impl AudioOut {
                                                 1.0 - MAX_NOMINAL_DEV,
                                                 1.0 + MAX_NOMINAL_DEV,
                                             );
+                                        let bias_now =
+                                            (INT_GAIN * integral_err).clamp(-MAX_TRIM, MAX_TRIM);
                                         eprintln!(
-                                            "audioout: clock ratio = {:.6} (obs {:.6}, fill_err {:+} over {} out)",
-                                            nominal_step, observed, fill_err, window_output_frames
+                                            "audioout: clock ratio = {:.6} (obs {:.6}, fill_err {:+} bias {:+.6} over {} out)",
+                                            nominal_step, observed, fill_err, bias_now, window_output_frames
                                         );
                                     }
                                 }

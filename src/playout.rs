@@ -41,6 +41,15 @@ const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 const WINDOW_SAMPLES: usize = 40; // ~10 s at 4 Hz reports
 const MIN_SAMPLES_FOR_DRIFT: usize = 8;
 
+/// Compensation for the asymmetric DAC pipelines on the two devices.
+/// `d_secs` is measured from "Mac sent RTP" to "iPad reported it as played"
+/// (i.e. handed to iPad DAC). It doesn't include the iPad's DAC→air latency
+/// and doesn't subtract the Mac's ring→air latency. Net: Mac plays early by
+/// roughly (ipad_dac − mac_dac). Bump this constant to push Mac later until
+/// Mac and iPad speakers align by ear. Positive = add delay on Mac side.
+/// Override at runtime with env STEREO_PLAYOUT_OFFSET_MS=<float>.
+const DEFAULT_PLAYOUT_OFFSET_MS: f64 = 0.0;
+
 fn ntp_now() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -133,10 +142,21 @@ pub fn spawn(
     };
     println!("playout: listening on 0.0.0.0:{PORT}");
 
+    let offset_ms: f64 = std::env::var("STEREO_PLAYOUT_OFFSET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PLAYOUT_OFFSET_MS);
+    println!("playout: pipeline compensation = {:+.1} ms", offset_ms);
+
     thread::spawn(move || {
         let mut buf = [0u8; 64];
         let mut estimator = ClockEstimator::new();
         let mut report_count: u64 = 0;
+        let pipeline_offset_s = offset_ms / 1000.0;
+        // Track the minimum dejitter depth seen between log prints — a dip
+        // toward 0 means the iPad's playout buffer underran (audible as
+        // glitches/dropouts on iPad).
+        let mut min_depth_window: u32 = u32::MAX;
 
         loop {
             let n = match socket.recv(&mut buf) {
@@ -201,7 +221,7 @@ pub fn spawn(
             let delta_samples = last_rtp_played.wrapping_sub(anchor_rtp) as i32 as f64;
             let t_sent_mac_s = ntp_to_secs(anchor_ntp) + delta_samples / sample_rate as f64;
 
-            let d_secs = t_played_mac_s - t_sent_mac_s;
+            let d_secs = t_played_mac_s - t_sent_mac_s + pipeline_offset_s;
             if !(0.005..=1.0).contains(&d_secs) {
                 eprintln!(
                     "playout: ignoring report (d={:.1} ms, rtp={}, depth={})",
@@ -217,6 +237,7 @@ pub fn spawn(
             let next = (prev + (target_frames - prev) / 4).max(0) as usize;
             target_delay_frames.store(next, Ordering::Relaxed);
 
+            min_depth_window = min_depth_window.min(dejitter_depth);
             report_count += 1;
             // Log every ~2 s (every 8th report at 4 Hz) to keep stderr quiet.
             if report_count % 8 == 0 {
@@ -224,14 +245,21 @@ pub fn spawn(
                     .drift_ppm()
                     .map(|p| format!("{:+.1} ppm", p))
                     .unwrap_or_else(|| "—".to_string());
+                let depth_ms =
+                    (dejitter_depth as f64 / sample_rate as f64) * 1000.0;
+                let min_depth_ms =
+                    (min_depth_window as f64 / sample_rate as f64) * 1000.0;
                 println!(
-                    "playout: ipad delay={:.1}ms depth={} offset={:+.3}ms drift={} target={}",
+                    "playout: ipad delay={:.1}ms depth={} ({:.1}ms, min {:.1}ms) offset={:+.3}ms drift={} target={}",
                     d_secs * 1000.0,
                     dejitter_depth,
+                    depth_ms,
+                    min_depth_ms,
                     offset_s * 1000.0,
                     drift,
                     next
                 );
+                min_depth_window = u32::MAX;
             }
         }
     });
